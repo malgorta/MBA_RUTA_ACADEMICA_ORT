@@ -1,4 +1,170 @@
 import streamlit as st
+from lib.db import get_session
+from lib.models import Estudiante, PlanVersion, StudentPlanItem, Enrollment, Course
+from lib.metrics import check_electives_count, check_orientation_rule
+from datetime import date, datetime
+from lib.utils import get_logger
+
+logger = get_logger(__name__)
+
+
+def _append_changelog(text: str):
+    ts = datetime.utcnow().isoformat()
+    line = f"[{ts}] {text}\n"
+    try:
+        with open('ChangeLog.md', 'a', encoding='utf-8') as f:
+            f.write(line)
+    except Exception as e:
+        logger.error(f"No se pudo escribir ChangeLog: {e}")
+
+
+def run():
+    st.title("📝 Inscripciones — Reconciliación con Plan")
+
+    with get_session() as session:
+        estudiantes = session.query(Estudiante).order_by(Estudiante.nombre).all()
+
+    if not estudiantes:
+        st.info("No hay estudiantes registrados")
+        return
+
+    est_map = {f"{e.nombre} ({e.documento})": e.id for e in estudiantes}
+    sel = st.selectbox("Seleccionar Estudiante", list(est_map.keys()))
+    estudiante_id = est_map.get(sel)
+
+    if not estudiante_id:
+        return
+
+    with get_session() as session:
+        current_version = session.query(PlanVersion).filter(
+            PlanVersion.estudiante_id == estudiante_id,
+            PlanVersion.vigente_hasta == None
+        ).order_by(PlanVersion.creado_en.desc()).first()
+
+        plan_items = []
+        if current_version:
+            plan_items = session.query(StudentPlanItem).filter(
+                StudentPlanItem.plan_version_id == current_version.id
+            ).all()
+
+        enrollments = session.query(Enrollment).filter(Enrollment.estudiante_id == estudiante_id).all()
+
+    st.subheader("Plan vigente vs Enrollments reales")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("**Plan (vigente)**")
+        if current_version and plan_items:
+            for it in plan_items:
+                curso = it.course.nombre if it.course else f"ID {it.course_id}"
+                st.write(f"- {curso} | Año: {it.ano} | Tipo: {it.course.tipo_materia if it.course else '-'} | Prioridad: {it.prioridad} | Backup: {it.es_backup}")
+        else:
+            st.info("No hay plan vigente o no tiene items")
+
+    with col2:
+        st.markdown("**Enrollments reales**")
+        if enrollments:
+            for en in enrollments:
+                curso = en.course.nombre if en.course else f"ID {en.course_id}"
+                with st.expander(f"{curso} — {en.status}"):
+                    st.write(f"Semestre: {en.semestre} | Año: {en.ano} | Nota: {en.nota} | Nota num: {en.nota_numerica}")
+                    # Edit form
+                    with st.form(f"edit_en_{en.id}"):
+                        status = st.selectbox("Status", ["planned","in_progress","completed","dropped"], index=["planned","in_progress","completed","dropped"].index(en.status) if en.status in ["planned","in_progress","completed","dropped"] else 0)
+                        nota = st.text_input("Nota (texto)", value=en.nota or "")
+                        nota_num = st.number_input("Nota numérica", value=en.nota_numerica if en.nota_numerica is not None else 0.0, format="%.2f")
+                        ano = st.number_input("Año", value=en.ano or date.today().year)
+                        semestre = st.number_input("Semestre", value=en.semestre or 1, min_value=1, max_value=8)
+                        submitted = st.form_submit_button("Guardar cambios")
+                        if submitted:
+                            with get_session() as session:
+                                e = session.query(Enrollment).get(en.id)
+                                e.status = status
+                                e.nota = nota or None
+                                e.nota_numerica = float(nota_num) if nota_num else None
+                                e.ano = int(ano)
+                                e.semestre = int(semestre)
+                                session.commit()
+                                _append_changelog(f"Estudiante {estudiante_id}: edit Enrollment {e.id} status={e.status}")
+                            st.success("Enrollment actualizado")
+                            st.experimental_rerun()
+
+                    if st.button("❌ Eliminar enrollment", key=f"del_en_{en.id}"):
+                        if st.confirm("Confirmar eliminación de enrollment?"):
+                            with get_session() as session:
+                                e = session.query(Enrollment).get(en.id)
+                                session.delete(e)
+                                session.commit()
+                                _append_changelog(f"Estudiante {estudiante_id}: eliminado Enrollment {en.id}")
+                            st.success("Enrollment eliminado")
+                            st.experimental_rerun()
+        else:
+            st.info("No hay enrollments registrados para este estudiante")
+
+    st.markdown("---")
+    st.subheader("Acciones de reconciliación")
+    if st.button("🔁 Reconciliar: crear enrollments faltantes (status=planned) basados en el plan"):
+        if not current_version or not plan_items:
+            st.error("No hay plan vigente para reconciliar")
+        else:
+            created = 0
+            with get_session() as session:
+                existing_course_ids = {e.course_id for e in session.query(Enrollment).filter(Enrollment.estudiante_id == estudiante_id).all()}
+                for it in plan_items:
+                    if it.course_id not in existing_course_ids:
+                        en = Enrollment(
+                            estudiante_id=estudiante_id,
+                            course_id=it.course_id,
+                            status='planned',
+                            ano=it.ano,
+                            semestre=1
+                        )
+                        session.add(en)
+                        created += 1
+                session.commit()
+                if created:
+                    _append_changelog(f"Estudiante {estudiante_id}: reconciliación creó {created} enrollments (status=planned)")
+            st.success(f"Reconciliación completada: {created} enrollments creados")
+            st.experimental_rerun()
+
+    st.markdown("---")
+    st.subheader("Alertas automáticas")
+    # Alert: curso cursado que no está en plan
+    with get_session() as session:
+        plan_course_ids = {it.course_id for it in session.query(StudentPlanItem).filter(StudentPlanItem.plan_version_id == current_version.id).all()} if current_version else set()
+        enroll_course_ids = [e.course_id for e in session.query(Enrollment).filter(Enrollment.estudiante_id == estudiante_id).all()]
+
+    not_in_plan = [cid for cid in enroll_course_ids if cid not in plan_course_ids]
+    if not_in_plan:
+        st.warning(f"Cursos matriculados que NO están en el plan vigente: {len(not_in_plan)}")
+        with get_session() as session:
+            for cid in not_in_plan:
+                c = session.query(Course).get(cid)
+                st.write(f"- {c.nombre if c else 'ID ' + str(cid)}")
+
+    # Repeated enrollments
+    with get_session() as session:
+        enrolls = session.query(Enrollment).filter(Enrollment.estudiante_id == estudiante_id).all()
+    repeats = {}
+    for e in enrolls:
+        repeats.setdefault(e.course_id, 0)
+        repeats[e.course_id] += 1
+    repeated = [cid for cid, cnt in repeats.items() if cnt > 1]
+    if repeated:
+        st.warning(f"Cursos repetidos en enrollments: {len(repeated)}")
+        with get_session() as session:
+            for cid in repeated:
+                c = session.query(Course).get(cid)
+                st.write(f"- {c.nombre if c else 'ID ' + str(cid)} (veces: {repeats[cid]})")
+
+    # Alerta crítica: baja que compromete 5/8 (si el estudiante baja un enrollment planeado/in_progress que es clave)
+    electivas = check_electives_count(estudiante_id)
+    orient = check_orientation_rule(estudiante_id)
+    if electivas.get('electivas_planeadas_o_completadas', 0) < 8:
+        st.warning(f"Objetivo electivas no alcanzado: {electivas.get('electivas_planeadas_o_completadas',0)}/8")
+    if not orient.get('cumple_regla', True):
+        st.info(f"Orientación objetivo no alcanzada: máximo {orient.get('max_electivas',0)} de 5")
+import streamlit as st
 from datetime import date, datetime
 import pandas as pd
 from lib.db import get_session
